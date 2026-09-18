@@ -49,6 +49,7 @@ import {
 	readToolSupersedeKey,
 } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
+import { TYPESAFE_PROVIDER, TypeSafeJudge, type JudgmentResult, type Questions } from "@oh-my-pi/pi-ai";
 import type {
 	AssistantMessage,
 	CodexCompactionContext,
@@ -85,6 +86,7 @@ import {
 	resolveMethodSettings,
 	resolveSpeculationMethod,
 } from "./compaction-methods";
+import { selectJevShakeRegions } from "./jev-compaction";
 import {
 	assistantTurnProducedOutput,
 	convertToLlm,
@@ -763,6 +765,7 @@ export class SessionMaintenance {
 			requireArtifact?: boolean;
 			isCurrent?: () => boolean;
 			toolResultsOnly?: boolean;
+			selectRegions?: (entries: SessionEntry[], regions: ShakeRegion[]) => Promise<ShakeRegion[]>;
 		} = {},
 	): Promise<ShakeResult> {
 		if (mode === "images") {
@@ -813,6 +816,10 @@ export class SessionMaintenance {
 		});
 		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
 		if (opts.toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
+		if (opts.selectRegions && regions.length > 0) {
+			regions = await opts.selectRegions(branchEntries, regions);
+			assertCurrent();
+		}
 		if (regions.length === 0) {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
 		}
@@ -825,6 +832,9 @@ export class SessionMaintenance {
 		}
 		assertCurrent();
 		let artifactId = reservedArtifact.id;
+		if (opts.requireArtifact && (!reservedArtifact.path || !artifactId)) {
+			throw new Error("shake could not allocate a durable recovery artifact");
+		}
 		const calculateReplacementState = (id: string | undefined) => {
 			const replacements = regions.map((region, index) => this.#shakeElidePlaceholder(region, index, id));
 			const replacementTokenCounts = replacements.map(replacement =>
@@ -4076,14 +4086,14 @@ export class SessionMaintenance {
 		// Snapcompact is local and instant, so an armed LLM summary (possible
 		// only when settings/model changed since arming) never overrides it.
 		const claimedSpec = this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
-		const armedSpec = method === "snapcompact" ? undefined : claimedSpec;
+		const armedSpec = method === "snapcompact" || method === "jev" ? undefined : claimedSpec;
 
 		const effectiveSettings = resolveMethodSettings(compactionSettings, method);
 		const fallbackFromShake = options.fallbackFromShake === true;
-		// Shake runs inline (cheap, no remote LLM). If it cannot recover enough
-		// context, resume from the next configured method instead of hardcoding a
-		// context-full summary.
-		if (method === "shake" && !armedSpec) {
+		// Both elision methods reuse artifact-backed shake. Jev selects regions
+		// remotely and accepts headroom before rewriting; mechanical shake keeps
+		// its existing post-rewrite fallback behavior.
+		if ((method === "shake" || method === "jev") && !armedSpec) {
 			const outcome = await this.#runAutoShake(
 				reason,
 				willRetry,
@@ -4093,12 +4103,13 @@ export class SessionMaintenance {
 				options.triggerContextTokens,
 				suppressContinuation,
 				options.detachPostCommit === true,
+				method,
 			);
 			if (outcome !== "fallback") return outcome;
 			return await this.runAutoCompaction(reason, willRetry, deferred, allowDefer, {
 				...options,
 				methodIndex: methodIndex + 1,
-				fallbackFromShake: true,
+				fallbackFromShake: method === "shake" || fallbackFromShake,
 			});
 		}
 		// "overflow" and "incomplete" force inline execution because they are recovery
@@ -5064,11 +5075,89 @@ export class SessionMaintenance {
 		return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
 	}
 
+	/** Select recoverable results without rewriting unless the candidate clears the recovery band. */
+	async #runJevElision(generation: number, signal: AbortSignal, triggerContextTokens?: number): Promise<ShakeResult> {
+		const registry = this.#host.modelRegistry;
+		if (!registry.authStorage.hasAuth(TYPESAFE_PROVIDER)) {
+			throw new Error("Jev compaction requires TypeSafe credentials; use /login typesafe.");
+		}
+		const model = this.#model;
+		const settings = this.#host.settings.getGroup("compaction");
+		const contextWindow = model?.contextWindow ?? 0;
+		const contextTokens = triggerContextTokens ?? this.#host.getContextUsage({ contextWindow })?.tokens;
+		if (contextWindow <= 0 || contextTokens === undefined || !Number.isFinite(contextTokens)) {
+			throw new Error("Jev compaction requires a known context budget.");
+		}
+		const recoveryBand = Math.floor(resolveThresholdTokens(contextWindow, settings) * COMPACTION_RECOVERY_BAND);
+		const config: ShakeConfig = {
+			...DEFAULT_SHAKE_CONFIG,
+			minSavings: Math.max(DEFAULT_SHAKE_CONFIG.minSavings, Math.ceil(contextTokens - recoveryBand)),
+		};
+		const manager = this.#host.sessionManager;
+		const owner = { sessionId: manager.getSessionId(), parentId: manager.getLeafId() };
+		const messages = this.#host.messages();
+		const settingsSnapshot = JSON.stringify(settings);
+		const isCurrent = () =>
+			!this.#host.isDisposed() &&
+			this.#host.promptGeneration() === generation &&
+			manager.getSessionId() === owner.sessionId &&
+			manager.getLeafId() === owner.parentId &&
+			this.#host.messages() === messages &&
+			this.#model === model &&
+			JSON.stringify(this.#host.settings.getGroup("compaction")) === settingsSnapshot;
+		const judge = new TypeSafeJudge({
+			apiKey: registry.authStorage.resolver(TYPESAFE_PROVIDER, { sessionId: this.#host.sessionId() }),
+		});
+		const usage: JudgmentResult<Questions>[] = [];
+		try {
+			return await this.shake("elide", {
+				config,
+				signal,
+				requireArtifact: true,
+				isCurrent,
+				toolResultsOnly: true,
+				selectRegions: async (entries, regions) => {
+					// Rewriting stored entries cannot shrink an opaque provider replay payload.
+					const latestCompaction = getLatestCompactionEntry(entries);
+					if (getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined) {
+						const replayEnd = entries.lastIndexOf(latestCompaction!);
+						regions = regions.filter(region => entries.indexOf(region.entry as SessionEntry) > replayEnd);
+					}
+					return await selectJevShakeRegions({
+						entries,
+						regions,
+						judge,
+						signal,
+						obfuscate: text => this.#host.obfuscateTextForProvider(text) ?? "",
+						onUsage: result => usage.push(result),
+					});
+				},
+			});
+		} finally {
+			// Usage belongs to the initiating branch even when selection is rejected
+			// or the user switches sessions. Keep it out of snapshot validation.
+			for (const result of usage) {
+				const entryId = manager.appendModelUsage(
+					{
+						purpose: "jev-compaction",
+						role: TYPESAFE_PROVIDER,
+						api: result.api,
+						provider: result.provider,
+						model: result.model,
+						usage: result.usage,
+						stopReason: "stop",
+					},
+					owner,
+				);
+				if (entryId) owner.parentId = entryId;
+			}
+		}
+	}
+
 	/**
-	 * Run a shake-method auto-maintenance pass. Emits the
-	 * `auto_compaction_start`/`auto_compaction_end` pair with a shake `action`,
-	 * runs {@link shake} inline against the protect-window config, and schedules
-	 * continuation exactly like the context-full tail.
+	 * Run artifact-backed automatic maintenance with a shake or Jev action.
+	 * Jev rejects insufficient candidates before persistence; continuation
+	 * follows the same lifecycle as mechanical shake.
 	 *
 	 * Returns `"fallback"` when the caller should advance to the next configured
 	 * method; returns a check result when shake handled the maintenance itself.
@@ -5082,15 +5171,19 @@ export class SessionMaintenance {
 		triggerContextTokens?: number,
 		suppressContinuation = false,
 		detachPostCommit = false,
+		method: "shake" | "jev" = "shake",
 	): Promise<CompactionCheckResult | "fallback"> {
-		const action = "shake";
+		const action = method;
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;
 		const signal = controller.signal;
 		try {
 			await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action }, false);
-			const result = await this.#host.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });
+			const result =
+				method === "jev"
+					? await this.#runJevElision(generation, signal, triggerContextTokens)
+					: await this.#host.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });
 			if (signal.aborted) {
 				await this.#emitLifecycleEvent(
 					{
@@ -5128,7 +5221,8 @@ export class SessionMaintenance {
 			const contextWindow = this.#model?.contextWindow ?? 0;
 			const compactionSettings = this.#host.settings.getGroup("compaction");
 			let stillOverThreshold = false;
-			if (contextWindow > 0) {
+			// Jev has already accepted against this band before the first mutation.
+			if (method === "shake" && contextWindow > 0) {
 				if (typeof triggerContextTokens === "number" && Number.isFinite(triggerContextTokens)) {
 					const correctedTokens = Math.max(0, triggerContextTokens - result.tokensFreed);
 					const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
@@ -5139,11 +5233,17 @@ export class SessionMaintenance {
 					stillOverThreshold = shouldCompact(postShakeTokens, contextWindow, compactionSettings);
 				}
 			}
-			const shouldFallBack = reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
+			const shouldFallBack =
+				method === "jev"
+					? !reclaimed
+					: reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
 			if (shouldFallBack) {
-				const errorMessage = reclaimed
-					? `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; trying the next preferred compaction method.`
-					: "Auto-shake found nothing eligible to drop; trying the next preferred compaction method.";
+				const errorMessage =
+					method === "jev"
+						? "Auto-Jev could not free sufficient recoverable context; trying the next preferred compaction method."
+						: reclaimed
+							? `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; trying the next preferred compaction method.`
+							: "Auto-shake found nothing eligible to drop; trying the next preferred compaction method.";
 				await this.#emitLifecycleEvent(
 					{
 						type: "auto_compaction_end",
@@ -5210,7 +5310,7 @@ export class SessionMaintenance {
 				historyRewritten: true,
 			};
 		} catch (error) {
-			if (signal.aborted) {
+			if (signal.aborted || error instanceof CompactionCancelledError) {
 				await this.#emitLifecycleEvent(
 					{
 						type: "auto_compaction_end",
@@ -5223,7 +5323,7 @@ export class SessionMaintenance {
 				);
 				return COMPACTION_CHECK_NONE;
 			}
-			const message = error instanceof Error ? error.message : "shake failed";
+			const message = error instanceof Error ? error.message : `${method} failed`;
 			await this.#emitLifecycleEvent(
 				{
 					type: "auto_compaction_end",
@@ -5232,12 +5332,12 @@ export class SessionMaintenance {
 					aborted: false,
 					willRetry: false,
 					errorMessage: message,
-					skipped: false,
+					skipped: method === "jev",
 				},
 				detachPostCommit,
 			);
-			// Overflow still needs recovery even if shake threw.
-			return reason === "overflow" ? "fallback" : COMPACTION_CHECK_NONE;
+			// A rejected Jev transaction leaves the original transcript for fallback.
+			return method === "jev" || reason === "overflow" ? "fallback" : COMPACTION_CHECK_NONE;
 		} finally {
 			if (this.#autoCompactionAbortController === controller) {
 				this.#autoCompactionAbortController = undefined;

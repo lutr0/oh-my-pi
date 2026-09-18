@@ -2128,9 +2128,11 @@ export class EventController {
 					? "Auto-handoff"
 					: event.action === "shake"
 						? "Auto-shake"
-						: event.action === "snapcompact"
-							? "Auto-snapcompact"
-							: "Auto context-full maintenance";
+						: event.action === "jev"
+							? "Auto-Jev"
+							: event.action === "snapcompact"
+								? "Auto-snapcompact"
+								: "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -2154,6 +2156,7 @@ export class EventController {
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
+		const isJevAction = event.action === "jev";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
@@ -2163,15 +2166,16 @@ export class EventController {
 						? "Auto server compaction cancelled"
 						: isShakeAction
 							? "Auto-shake cancelled"
-							: isSnapcompactAction
-								? "Auto-snapcompact cancelled"
-								: "Auto context-full maintenance cancelled",
+							: isJevAction
+								? "Auto-Jev cancelled"
+								: isSnapcompactAction
+									? "Auto-snapcompact cancelled"
+									: "Auto context-full maintenance cancelled",
 			);
-		} else if (isShakeAction) {
-			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
-			// The fallback path (`errorMessage` set, `skipped` false) means shake reclaimed
-			// some tokens before deciding the threshold still wasn't cleared — rebuild so
-			// the chat reflects the dropped regions even though a context-full pass follows.
+		} else if (isShakeAction || isJevAction) {
+			// Shake and Jev produce no CompactionResult; rebuild on success, suppress skips.
+			// Shake may reclaim tokens before falling through to another method. Jev
+			// rejects insufficient savings before mutation and marks that attempt skipped.
 			if (event.errorMessage) {
 				if (!event.skipped) {
 					this.ctx.rebuildChatFromMessages();
@@ -2184,7 +2188,7 @@ export class EventController {
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender();
-				this.ctx.showStatus("Auto-shake completed");
+				this.ctx.showStatus(isJevAction ? "Auto-Jev completed" : "Auto-shake completed");
 			}
 		} else if (event.result) {
 			this.ctx.lastAssistantUsage = undefined;

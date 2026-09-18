@@ -35,6 +35,12 @@ export const COMPACTION_METHOD_CHOICES = [
 		label: "Shake",
 		description: "Drop recoverable heavy content in place without an LLM call",
 	},
+	{
+		value: "jev",
+		label: "Jev (experimental)",
+		description:
+			"Send context and old read-only tool results to TypeSafe for artifact-backed result selection; no summary",
+	},
 ] as const;
 
 /** One selectable automatic context-maintenance method. */
@@ -55,6 +61,7 @@ const COMPACTION_METHODS: Record<CompactionMethod, true> = {
 	handoff: true,
 	soft: true,
 	shake: true,
+	jev: true,
 };
 
 /** Whether an unknown configuration value names a supported compaction method. */
@@ -82,6 +89,7 @@ const STRATEGY_BY_COMPACTION_METHOD: Record<CompactionMethod, "context-full" | "
 	handoff: "handoff",
 	soft: "context-full",
 	shake: "shake",
+	jev: "shake",
 };
 
 /**
@@ -110,8 +118,8 @@ export function canUseRemoteCompaction(model: Model | null | undefined, settings
 
 /**
  * First configured method a threshold pass would run, or undefined when it is
- * local (snapcompact/shake) — local methods are effectively instant, so there
- * is nothing to speculate. Shared by the maintenance loop's speculation gate
+ * not a speculative summary (snapcompact/shake/jev). Jev scores results with
+ * TypeSafe but does not summarize. Shared by the maintenance loop's speculation gate
  * and the status line's annotated context gauge (speculation marker).
  */
 export function resolveSpeculationMethod(

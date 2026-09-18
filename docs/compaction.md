@@ -193,6 +193,32 @@ Including `shake` in `compaction.methodOrder` performs an inline, local reductio
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
 
+### Jev method (experimental, opt-in)
+
+Choose **Jev (experimental)** in the ordered compaction-method setting, or configure:
+
+```json
+{
+  "compaction": {
+    "methodOrder": ["jev", "remote", "soft"]
+  }
+}
+```
+
+The default order remains `["remote", "snapcompact", "handoff", "shake", "soft"]`; Jev is never enabled implicitly. This is an **automatic context-maintenance method**, not the general judgment setting. Manual `/shake` remains mechanical, and `/compact` keeps its existing summary-mode choices. Jev does not create or speculate a summary.
+
+**Transmission and authentication:** opting in sends bounded task context and eligible old tool-result text to TypeSafe for relevance scoring. Authenticate with `/login typesafe` or `TYPESAFE_API_KEY`. Jev uses the native TypeSafe judge and respects its `TYPESAFE_BASE_URL` and `TYPESAFE_DEFAULT_MODEL` defaults/overrides; it does not silently substitute a general LLM judge. Enable it only where transmitting that context to the configured TypeSafe service is acceptable.
+
+Jev selects only full-text results from read-only `read`, `grep`, and `glob` calls. Both the most recent **three assistant turns (including their tool results)** and the existing **16,000-token recent window** are protected, including during long tool loops within a single human request. Every tool call and its inputs, user/assistant prose, errors, state-changing or unknown tools, images and mixed/non-text results, and skill/plan/artifact-recovery content remain intact. Selection is not an instruction-following pass over the tool output.
+
+The selector uses complete eligible result bodies, never a size-only or sampled proxy, and obfuscates outbound state through the normal provider boundary. Results too large for a bounded request stay in context. It makes at most eight sequential native requests within a 15-second overall deadline, and offloads only results with a finite unnecessary-for-next-step score of at least 0.9. This conservative experimental threshold is not a calibrated safety guarantee; durable recovery and local acceptance checks remain mandatory.
+
+Selected results are elided through the existing artifact-backed shake mechanism, not deleted irreversibly: their replacement carries an `artifact://` pointer, and `read` can retrieve the original content after session reload. The UI reports `Auto-Jev` lifecycle status and rebuilds history without a `CompactionResult` summary.
+
+Acceptance is transactional. Before changing history, actual replacement savings must reach at least 4,000 tokens and cover the provider-anchored reduction needed to reach the 80% recovery band. Missing credentials, scoring failure, the 15-second deadline, or insufficient provider headroom advance to the next configured method on the original history. A large protected prose floor still needs `soft` or `remote`; Jev is not a replacement for summary fallback. It makes no promise of instant execution, preserved prompt caches, a fixed 90% reduction, or unchanged downstream answer quality.
+
+The motivation comes from [Tamara Tran's Jev post](https://x.com/tamarajtran/status/2100694549362553153), [Kun Chen's discussion](https://x.com/kunchenguid/status/2100800776620900454), and [Jake Mor's reference](https://x.com/jakemor/status/2100783922867016145), with the [original fast-jev-compaction library, version 0.2.0](https://github.com/tamaratran/fast-jev-compaction/tree/e3f262a7f4d42bd8dd32ced30d26176f7cb545b0) as the implementation reference. These are motivations, not OMP performance guarantees. The original library's selected-output pruning is irreversible in its returned context; OMP instead retains recoverable artifacts and protects the broader categories above. The original plugin already falls back to summarization on errors or reduction below 25%; that plugin lifecycle is distinct from the standalone library's pruning behavior.
+
 ### Snapcompact method
 
 Including `snapcompact` in `compaction.methodOrder` replaces the LLM summarization call with a local, deterministic archival pass (`compact` from `@oh-my-pi/snapcompact`):
